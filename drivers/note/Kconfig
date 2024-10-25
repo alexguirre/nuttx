@@ -84,6 +84,20 @@ config DRIVERS_NOTERAM_DEFAULT_NOOVERWRITE
 		is full by default. This is useful to keep instrumentation data of the
 		beginning of a system boot.
 
+config DRIVERS_NOTERAM_FLUSH
+	bool "Flush note RAM buffer to a file when full"
+	default n
+	---help---
+  If this option is enabled, when the buffer is full dump all contents to a
+  file.
+
+config DRIVERS_NOTERAM_FLUSH_PATH
+	string "Note RAM flush file path"
+	depends on DRIVERS_NOTERAM_FLUSH
+	default "/dev/ttyS1"
+	---help---
+		The Note driver output to file path.
+
 config DRIVERS_NOTERAM_CRASH_DUMP
 	bool "Dump noteram buffer on panic"
 	default n

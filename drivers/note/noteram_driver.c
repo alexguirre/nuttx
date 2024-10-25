@@ -37,6 +37,7 @@
 #include <nuttx/spinlock.h>
 #include <nuttx/sched.h>
 #include <nuttx/sched_note.h>
+#include <nuttx/streams.h>
 #include <nuttx/kmalloc.h>
 #include <nuttx/note/note_driver.h>
 #include <nuttx/note/noteram_driver.h>
@@ -119,6 +120,7 @@ static int noteram_poll(FAR struct file *filep, FAR struct pollfd *fds,
                         bool setup);
 static void noteram_add(FAR struct note_driver_s *drv,
                         FAR const void *note, size_t len);
+static void noteram_dump(FAR struct noteram_driver_s *drv, FAR struct lib_outstream_s *stream);
 static void
 noteram_dump_init_context(FAR struct noteram_dump_context_s *ctx);
 static int noteram_dump_one(FAR uint8_t *p, FAR struct lib_outstream_s *s,
@@ -695,6 +697,11 @@ static void noteram_add(FAR struct note_driver_s *driver,
   unsigned int remain;
   unsigned int space;
   irqstate_t flags;
+#ifdef CONFIG_DRIVERS_NOTERAM_FLUSH
+  struct file outfile;
+  struct lib_fileoutstream_s outstream;
+  int ret;
+#endif
 
   flags = spin_lock_irqsave_wo_note(&drv->lock);
 
@@ -709,6 +716,25 @@ static void noteram_add(FAR struct note_driver_s *driver,
 
   if (remain <= NOTE_ALIGN(notelen))
     {
+#ifdef CONFIG_DRIVERS_NOTERAM_FLUSH
+      ret = file_open(&outfile, CONFIG_DRIVERS_NOTERAM_FLUSH_PATH, O_WRONLY | O_CREAT | O_APPEND);
+      if (ret < 0)
+        {
+          spin_unlock_irqrestore_wo_note(&drv->lock, flags);
+          return;
+        }
+
+      file_seek(&outfile, 0, SEEK_END); // needed for bad FS that don't place the file pointer at the end in append mode
+
+      lib_fileoutstream(&outstream, &outfile);
+      noteram_dump(drv, &outstream.common);
+
+      file_close(&outfile);
+
+      /* Empty the buffer after flush */
+
+      noteram_buffer_clear(drv);
+#else
       if (drv->ni_overwrite == NOTERAM_MODE_OVERWRITE_DISABLE)
         {
           /* Stop recording if not in overwrite mode */
@@ -727,6 +753,7 @@ static void noteram_add(FAR struct note_driver_s *driver,
           remain = drv->ni_bufsize - noteram_length(drv);
         }
       while (remain <= NOTE_ALIGN(notelen));
+#endif
     }
 
   head = drv->ni_head;
@@ -1181,7 +1208,7 @@ static int noteram_dump_one(FAR uint8_t *p, FAR struct lib_outstream_s *s,
           }
         else
           {
-            ret += lib_sprintf(s, "tracing_mark_write: %c|%d|%pS\n",
+            ret += lib_sprintf(s, "tracing_mark_write: %c|%d|%p\n",
                                c, pid, (FAR void *)ip);
           }
       }
@@ -1236,20 +1263,21 @@ static int noteram_dump_one(FAR uint8_t *p, FAR struct lib_outstream_s *s,
   return ret;
 }
 
-#ifdef CONFIG_DRIVERS_NOTERAM_CRASH_DUMP
-
 /****************************************************************************
  * Name: noteram_dump
  ****************************************************************************/
 
-static void noteram_dump(FAR struct noteram_driver_s *drv)
+static void noteram_dump(FAR struct noteram_driver_s *drv, FAR struct lib_outstream_s *stream)
 {
   struct noteram_dump_context_s ctx;
-  struct lib_syslograwstream_s stream;
   uint8_t note[256];
+  unsigned int prev_read = drv->ni_read;
 
-  lib_syslograwstream_open(&stream);
-  lib_sprintf(&stream.common, "# tracer:nop\n#\n");
+  drv->ni_read = drv->ni_tail;
+  noteram_dump_init_context(&ctx);
+  ctx.mode = NOTERAM_MODE_READ_ASCII;
+
+  lib_sprintf(stream, "# tracer:nop\n#\n");
 
   while (1)
     {
@@ -1261,9 +1289,24 @@ static void noteram_dump(FAR struct noteram_driver_s *drv)
           break;
         }
 
-      noteram_dump_one(note, &stream.common, &ctx);
+      noteram_dump_one(note, stream, &ctx);
     }
 
+  drv->ni_read = prev_read;
+}
+
+#ifdef CONFIG_DRIVERS_NOTERAM_CRASH_DUMP
+
+/****************************************************************************
+ * Name: noteram_dump_to_syslog
+ ****************************************************************************/
+
+static void noteram_dump_to_syslog(FAR struct noteram_driver_s *drv)
+{
+  struct lib_syslograwstream_s stream;
+
+  lib_syslograwstream_open(&stream);
+  noteram_dump(drv, &stream.common);
   lib_syslograwstream_close(&stream);
 }
 
@@ -1276,7 +1319,7 @@ static int noteram_crash_dump(FAR struct notifier_block *nb,
 {
   if (action == PANIC_KERNEL)
     {
-      noteram_dump(&g_noteram_driver);
+      noteram_dump_to_syslog(&g_noteram_driver);
     }
 
   return 0;
