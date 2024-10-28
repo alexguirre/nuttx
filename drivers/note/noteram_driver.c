@@ -294,6 +294,8 @@ static unsigned int noteram_unread_length(FAR struct noteram_driver_s *drv)
   return head - read;
 }
 
+#ifndef CONFIG_DRIVERS_NOTERAM_FLUSH
+
 /****************************************************************************
  * Name: noteram_remove
  *
@@ -339,6 +341,7 @@ static void noteram_remove(FAR struct noteram_driver_s *drv)
 
   drv->ni_tail = noteram_next(drv, tail, length);
 }
+#endif
 
 /****************************************************************************
  * Name: noteram_get
@@ -699,7 +702,8 @@ static void noteram_add(FAR struct note_driver_s *driver,
   irqstate_t flags;
 #ifdef CONFIG_DRIVERS_NOTERAM_FLUSH
   struct file outfile;
-  struct lib_fileoutstream_s outstream;
+  struct lib_fileoutstream_s outfilestream;
+  struct lib_bufferedoutstream_s outstream;
   int ret;
 #endif
 
@@ -726,9 +730,11 @@ static void noteram_add(FAR struct note_driver_s *driver,
 
       file_seek(&outfile, 0, SEEK_END); // needed for bad FS that don't place the file pointer at the end in append mode
 
-      lib_fileoutstream(&outstream, &outfile);
+      lib_fileoutstream(&outfilestream, &outfile);
+      lib_bufferedoutstream(&outstream, &outfilestream.common);
       noteram_dump(drv, &outstream.common);
 
+      lib_stream_flush(&outstream);
       file_close(&outfile);
 
       /* Empty the buffer after flush */
