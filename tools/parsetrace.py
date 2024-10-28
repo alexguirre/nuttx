@@ -29,6 +29,7 @@ import re
 import struct
 import subprocess
 from typing import Union
+from enum import IntEnum, auto
 
 try:
     import colorlog
@@ -39,10 +40,11 @@ try:
     from elftools.elf.sections import SymbolTableSection
     from pycstruct import pycstruct
     from pydantic import BaseModel
+    from kconfiglib import Kconfig
 
 except ModuleNotFoundError:
     print("Please execute the following command to install dependencies:")
-    print("pip install pyelftools cxxfilt pydantic parse pycstruct colorlog serial")
+    print("pip install pyelftools cxxfilt pydantic parse pycstruct colorlog serial kconfiglib")
     exit(1)
 
 logger = logging.getLogger(__name__)
@@ -63,6 +65,45 @@ stream_handler.setFormatter(formatter)
 logger.addHandler(stream_handler)
 
 
+# Keep in sync with enum note_type_e in include/nuttx/sched_note.h
+class NOTE(IntEnum):
+    START = 0
+    STOP = auto()
+    SUSPEND = auto()
+    RESUME = auto()
+    CPU_START = auto()
+    CPU_STARTED = auto()
+    CPU_PAUSE = auto()
+    CPU_PAUSED = auto()
+    CPU_RESUME = auto()
+    CPU_RESUMED = auto()
+    PREEMPT_LOCK = auto()
+    PREEMPT_UNLOCK = auto()
+    CSECTION_ENTER = auto()
+    CSECTION_LEAVE = auto()
+    SPINLOCK_LOCK = auto()
+    SPINLOCK_LOCKED = auto()
+    SPINLOCK_UNLOCK = auto()
+    SPINLOCK_ABORT = auto()
+    SYSCALL_ENTER = auto()
+    SYSCALL_LEAVE = auto()
+    IRQ_ENTER = auto()
+    IRQ_LEAVE = auto()
+    WDOG_START = auto()
+    WDOG_CANCEL = auto()
+    WDOG_ENTER = auto()
+    WDOG_LEAVE = auto()
+    HEAP_ADD = auto()
+    HEAP_REMOVE = auto()
+    HEAP_ALLOC = auto()
+    HEAP_FREE = auto()
+    DUMP_PRINTF = auto()
+
+    DUMP_BEGIN = auto()
+    DUMP_END = auto()
+    DUMP_MARK = auto()
+    DUMP_COUNTER = auto()
+
 class SymbolTables(object):
     def __init__(self, file):
         elffile = open(file, "rb")
@@ -72,7 +113,7 @@ class SymbolTables(object):
         self.symbol_dict = dict()
         self.addr_list = list()
         self.__parse_header()
-        self.parse_symbol()
+        self.__parse_symbol()
 
     def __parse_header(self):
         elf_header = self.elffile.header
@@ -83,6 +124,8 @@ class SymbolTables(object):
         self.typeinfo["size_t"] = "uint%d" % self.elfinfo["bitwides"]
         self.typeinfo["long"] = "int%d" % self.elfinfo["bitwides"]
         self.typeinfo["pid_t"] = "int32"
+        self.typeinfo["time_t"] = "int%d" % (self.get_typesize("time_t") * 8)
+        self.typeinfo["clock_t"] = "uint%d" % (self.get_typesize("clock_t") * 8)
 
     def __symbol_filter(self, symbol):
         if symbol["st_info"]["type"] != "STT_FUNC":
@@ -107,7 +150,7 @@ class SymbolTables(object):
 
         return symbol_tables[0]
 
-    def parse_symbol(self):
+    def __parse_symbol(self):
         if self.elffile is None:
             return
 
@@ -171,6 +214,64 @@ class SymbolTables(object):
         if index != -1:
             return self.symbol_dict[self.addr_list[index - 1]]
         return "<%#x>: unknow function" % addr
+
+
+# Keep in sync with struct note_*_s in include/nuttx/sched_note.h
+class NoteStructs:
+    def __init__(self, symbol_tables: SymbolTables):
+        self.symbol_tables = symbol_tables
+
+    def note_common_define(self):
+        """struct note_common_s"""
+        typeinfo = self.symbol_tables.typeinfo
+        d = pycstruct.StructDef(alignment=4)
+        d.add("uint8", "nc_length")
+        d.add("uint8", "nc_type")
+        d.add("uint8", "nc_priority")
+        d.add("uint8", "nc_cpu")
+        d.add(typeinfo["pid_t"], "nc_pid")
+        d.add(typeinfo["clock_t"], "nc_systime")
+        return d
+
+    def note_start_define(self, name_length):
+        """struct note_start_s"""
+        typeinfo = self.symbol_tables.typeinfo
+        d = pycstruct.StructDef(alignment=4)
+        d.add(self.note_common_define(), "cmn")
+        if name_length > 0:
+            d.add("uint8", "nst_name", length=name_length)
+        return d
+
+    def note_irqhandler_define(self):
+        """struct note_irqhandler_s"""
+        typeinfo = self.symbol_tables.typeinfo
+        d = pycstruct.StructDef(alignment=4)
+        d.add(self.note_common_define(), "cmn")
+        d.add(typeinfo["size_t"], "nih_handler")
+        d.add("uint8", "nih_irq")
+        return d
+
+    def note_printf_define(self, data_length):
+        """struct note_printf_s"""
+        typeinfo = self.symbol_tables.typeinfo
+        d = pycstruct.StructDef(alignment=4)
+        d.add(self.note_common_define(), "cmn")
+        d.add(typeinfo["size_t"], "npt_ip")
+        d.add(typeinfo["size_t"], "npt_fmt")
+        d.add("uint32", "npt_type")
+        if data_length > 0:
+            d.add("uint8", "npt_data", length=data_length)
+        return d
+
+    def note_event_define(self, data_length=0):
+        """struct note_printf_s"""
+        typeinfo = self.symbol_tables.typeinfo
+        d = pycstruct.StructDef(alignment=4)
+        d.add(self.note_common_define(), "cmn")
+        d.add(typeinfo["size_t"], "nev_ip")
+        if data_length > 0:
+            d.add("uint8", "nev_data", length=data_length)
+        return d
 
 
 class OtherModel(BaseModel):
@@ -278,13 +379,12 @@ class ParseBinaryLogTool:
         self.elf_nuttx_path = elf_nuttx_path
         self.out_path = out_path
         self.symbol_tables = SymbolTables(self.elf_nuttx_path)
-        self.symbol_tables.parse_symbol()
+        self.note_structs = NoteStructs(self.symbol_tables)
         with open(self.binary_log_path, "rb") as f:
             self.in_bytes = f.read()
         self.parsed = list()
         self.task_name_dict = dict()
         self.size_long = size_long
-        self.size_note_common = 3 + size_long * 3
         self.config_endian_big = config_endian_big
 
     def parse_by_endian(self, lis):
@@ -298,36 +398,29 @@ class ParseBinaryLogTool:
     def parse_one(self, st: int):
         if st >= len(self.in_bytes):
             print("error, index break bound")
-        one = pycstruct.StructDef()
-        one.add("uint8", "nc_length")
-        one.add("uint8", "nc_type")
-        one.add("uint8", "nc_priority")
-        one.add("uint8", "nc_cpu")
-        one.add("uint8", "nc_pid", self.size_long)
-        one.add("uint8", "nc_systime_sec", self.size_long)
-        one.add("uint8", "nc_systime_nsec", self.size_long)
-        res = one.deserialize(self.in_bytes, st)
+
+        cmn_def = self.note_structs.note_common_define()
+        cmn = cmn_def.deserialize(self.in_bytes, st)
 
         # case type
-        if res["nc_type"] == 0:
-            one.add("uint8", "nsa_name", res["nc_length"] - self.size_note_common)
-        elif res["nc_type"] == 22:
-            one.add("uint8", "nst_ip", self.size_long)  # pointer of func
-            one.add("uint8", "nst_data")  # B|E
-        elif res["nc_type"] == 20:  # case: NOTE_IRQ_ENTER
-            one.add("uint8", "nih_irq")
-        elif res["nc_type"] == 21:  # case: NOTE_IRQ_LEAVE
-            one.add("uint8", "nih_irq")
-        else:
-            print(f'skipped note, nc_type={res["nc_type"]}')
+        match cmn["nc_type"]:
+            case NOTE.START:
+                name_length = cmn["nc_length"] - cmn_def.size()
+                note_def = self.note_structs.note_start_define(name_length)
+            case NOTE.IRQ_ENTER | NOTE.IRQ_LEAVE:
+                note_def = self.note_structs.note_irqhandler_define()
+            case NOTE.DUMP_BEGIN | NOTE.DUMP_END:
+                note_def = self.note_structs.note_event_define()
+            case _:
+                print(f'skipped note, nc_type={res["nc_type"]}')
 
-        res = one.deserialize(self.in_bytes, st)
+        res = note_def.deserialize(self.in_bytes, st)
         # parse pid, systime ...
-        res["nc_pid"] = self.parse_by_endian(res["nc_pid"])[0]
-        res["nc_systime_sec"] = self.parse_by_endian(res["nc_systime_sec"])[0]
-        res["nc_systime_nsec"] = self.parse_by_endian(res["nc_systime_nsec"])[0]
-        if "nst_ip" in res:
-            res["nst_ip"] = self.parse_by_endian(res["nst_ip"])[1]
+        # res["nc_pid"] = self.parse_by_endian(res["nc_pid"])[0]
+        # res["nc_systime_sec"] = self.parse_by_endian(res["nc_systime_sec"])[0]
+        # res["nc_systime_nsec"] = self.parse_by_endian(res["nc_systime_nsec"])[0]
+        # if "nev_ip" in res:
+        #     res["nev_ip"] = self.parse_by_endian(res["nev_ip"])[1]
 
         # parse cpu, name ...
         if "nc_cpu" not in res:
@@ -335,41 +428,48 @@ class ParseBinaryLogTool:
         if "nsa_name" in res:
             nsa_name = "".join(chr(i) for i in res["nsa_name"][:-1])
             self.task_name_dict[res["nc_pid"]] = nsa_name
-        if "nst_data" in res:
-            res["nst_data"] = chr(res["nst_data"])
         return res
 
     def track_one(self, one):  # print by case
-        nc_type = one["nc_type"]
-        nc_pid = one["nc_pid"]
-        nc_cpu = one["nc_cpu"]
+        cmn = one["cmn"]
+        nc_type = cmn["nc_type"]
+        nc_pid = cmn["nc_pid"]
+        nc_cpu = cmn["nc_cpu"]
         nsa_name = self.task_name_dict.get(nc_pid, "noname")
         float_time = float(
-            str(one["nc_systime_sec"]) + "." + str(one["nc_systime_nsec"])
+            # TODO: convert nc_systime
+            # str(one["nc_systime_sec"]) + "." + str(one["nc_systime_nsec"])
+            str(cmn["nc_systime"]) + ".0"
         )
 
         # case nc_type
         a_model, other_model = None, None
-        if nc_type == 0:  # case: NOTE_START
-            payload = (
-                f"sched_wakeup_new: comm={nsa_name} pid={nc_pid} target_cpu={nc_cpu}"
-            )
-            other_model = OtherModel(payload="").parse(payload)
-        if nc_type == 3:  # case: NOTE_RESUME
-            payload = f"sched_waking: comm={nsa_name} pid={nc_pid} target_cpu={nc_cpu}"
-            other_model = OtherModel(payload="").parse(payload)
-        if nc_type == 22:  # case: NOTE_DUMP_STRING
-            func_name = self.symbol_tables.symbol_dict.get(
-                int(one["nst_ip"], 16), "no_func_name"
-            )
-            payload = f'tracing_mark_write: {one["nst_data"]}|{nc_pid}|{func_name}'
-            a_model = ATraceModel(sign="", pid=-1, func="").parse(payload)
-        if nc_type == 20:  # case: NOTE_IRQ_ENTER
-            payload = f'irq_handler_entry: irq={one["nih_irq"]} name={one["nih_irq"]}'
-            other_model = OtherModel(payload="").parse(payload)
-        if nc_type == 21:  # case: NOTE_IRQ_LEAVE
-            payload = f'irq_handler_exit: irq={one["nih_irq"]} name={one["nih_irq"]}'
-            other_model = OtherModel(payload="").parse(payload)
+        match nc_type:
+            case NOTE.START:
+                payload = (
+                    f"sched_wakeup_new: comm={nsa_name} pid={nc_pid} target_cpu={nc_cpu}"
+                )
+                other_model = OtherModel(payload="").parse(payload)
+            case NOTE.RESUME:  # case: NOTE_RESUME
+                payload = f"sched_waking: comm={nsa_name} pid={nc_pid} target_cpu={nc_cpu}"
+                other_model = OtherModel(payload="").parse(payload)
+        # if nc_type == 22:  # case: NOTE_DUMP_STRING   outdated
+        #     func_name = self.symbol_tables.symbol_dict.get(
+        #         int(one["nst_ip"], 16), "no_func_name"
+        #     )
+        #     payload = f'tracing_mark_write: {one["nst_data"]}|{nc_pid}|{func_name}'
+        #     a_model = ATraceModel(sign="", pid=-1, func="").parse(payload)
+            case NOTE.IRQ_ENTER:  # case: NOTE_IRQ_ENTER
+                payload = f'irq_handler_entry: irq={one["nih_irq"]} name={one["nih_irq"]}'
+                other_model = OtherModel(payload="").parse(payload)
+            case NOTE.IRQ_LEAVE:  # case: NOTE_IRQ_LEAVE
+                payload = f'irq_handler_exit: irq={one["nih_irq"]} name={one["nih_irq"]}'
+                other_model = OtherModel(payload="").parse(payload)
+            case NOTE.DUMP_BEGIN | NOTE.DUMP_END:
+                func_name = self.symbol_tables.symbol_dict.get(one["nev_ip"], "no_func_name")
+                c = "B" if nc_type == NOTE.DUMP_BEGIN else "E"
+                payload = f'tracing_mark_write: {c}|{nc_pid}|{func_name}'
+                a_model = ATraceModel(sign="", pid=-1, func="").parse(payload)
 
         for mod in [a_model, other_model]:
             if mod is not None:
@@ -388,7 +488,7 @@ class ParseBinaryLogTool:
         while st < len(self.in_bytes):
             one = self.parse_one(st)
             self.track_one(one)
-            st += one["nc_length"]
+            st += one["cmn"]["nc_length"]
         if self.out_path is not None:
             with open(self.out_path, "wt") as f:
                 for mod in self.parsed:
@@ -402,28 +502,13 @@ class TraceDecoder(SymbolTables):
     def __init__(self, elffile):
         super().__init__(elffile)
         self.data = b""
-        self.typeinfo["time_t"] = "int%d" % (self.get_typesize("time_t") * 8)
+        self.note_structs = NoteStructs(self)
 
     def note_common_define(self):
-        note_common = pycstruct.StructDef(alignment=4)
-        note_common.add("uint8", "nc_length")
-        note_common.add("uint8", "nc_type")
-        note_common.add("uint8", "nc_priority")
-        note_common.add("uint8", "nc_cpu")
-        note_common.add(self.typeinfo["pid_t"], "nc_pid")
-        note_common.add(self.typeinfo["time_t"], "nc_systime_sec")
-        note_common.add(self.typeinfo["long"], "nc_systime_nsec")
-        return note_common
+        return self.note_structs.note_common_define()
 
     def note_printf_define(self, length):
-        struct_def = pycstruct.StructDef(alignment=4)
-        struct_def.add(self.note_common_define(), "npt_cmn")
-        struct_def.add(self.typeinfo["size_t"], "npt_ip")
-        struct_def.add(self.typeinfo["size_t"], "npt_fmt")
-        struct_def.add("uint32", "npt_type")
-        if length > 0:
-            struct_def.add("uint8", "npt_data", length=length)
-        return struct_def
+        return self.note_structs.note_printf_define(length)
 
     def extract_int(self, fmt, data):
         pattern = re.match(
@@ -564,12 +649,13 @@ class TraceDecoder(SymbolTables):
     def print_format(self, note):
         payload = dict()
         payload["time"] = (
-            note["npt_cmn"]["nc_systime_sec"]
-            + note["npt_cmn"]["nc_systime_nsec"] / 1000000000
+            float(note["cmn"]["nc_systime"])  # TODO: convert nc_systime
+            # note["cmn"]["nc_systime_sec"]
+            # + note["cmn"]["nc_systime_nsec"] / 1000000000
         )
-        payload["pid"] = note["npt_cmn"]["nc_pid"]
+        payload["pid"] = note["cmn"]["nc_pid"]
         payload["cpu"] = (
-            0 if "nc_cpu" not in note["npt_cmn"] else note["npt_cmn"]["nc_cpu"]
+            0 if "nc_cpu" not in note["cmn"] else note["cmn"]["nc_cpu"]
         )
         payload["format"] = self.readstring(note["npt_fmt"])
         prefix = "[{time:.9f}] [{pid}] [CPU{cpu}]: ".format(**payload)
@@ -653,7 +739,6 @@ if __name__ == "__main__":
             trace = Trace(args.trace)
             if args.elf:
                 symbol = SymbolTables(args.elf)
-                symbol.parse_symbol()
 
                 for onetrace in trace.all_trace:
                     if isinstance(onetrace.payload, ATraceModel) and re.fullmatch(
@@ -677,7 +762,6 @@ if __name__ == "__main__":
                 parse_binary_log_tool = ParseBinaryLogTool(
                     args.trace, args.elf, out_path
                 )
-                parse_binary_log_tool.symbol_tables.parse_symbol()
                 parse_binary_log_tool.parse_binary_log()
             else:
                 print("error, please add elf file path")
