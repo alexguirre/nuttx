@@ -360,7 +360,7 @@ static void noteram_remove(FAR struct noteram_driver_s *drv)
  *
  ****************************************************************************/
 
-static ssize_t noteram_get(FAR struct noteram_driver_s *drv,
+static ssize_t noteram_get_slow(FAR struct noteram_driver_s *drv,
                            FAR uint8_t *buffer, size_t buflen)
 {
   FAR struct note_common_s *note;
@@ -422,6 +422,62 @@ static ssize_t noteram_get(FAR struct noteram_driver_s *drv,
 
   return notelen;
 }
+
+static ssize_t noteram_get_fast(FAR struct noteram_driver_s *drv,
+                           FAR uint8_t *buffer, size_t buflen)
+{
+  FAR struct note_common_s *note;
+  unsigned int space;
+  unsigned int read;
+  ssize_t notelen;
+  size_t circlen;
+
+  DEBUGASSERT(buffer != NULL);
+
+  /* Verify that the circular buffer is not empty */
+
+  circlen = noteram_unread_length(drv);
+  if (circlen <= 0)
+    {
+      return 0;
+    }
+
+  /* Get the read index of the circular buffer */
+
+  read = drv->ni_read;
+  DEBUGASSERT(read < drv->ni_bufsize);
+
+  /* Get the length of the note at the read index */
+
+  note = (FAR struct note_common_s *)&drv->ni_buffer[read];
+  notelen = note->nc_length;
+  DEBUGASSERT(notelen <= circlen);
+
+  /* Is the user buffer large enough to hold the note? */
+
+  if (buflen < notelen)
+    {
+      /* Skip the large note so that we do not get constipated. */
+
+      drv->ni_read = noteram_next(drv, read, NOTE_ALIGN(notelen));
+
+      /* and return an error */
+
+      return -EFBIG;
+    }
+
+  /* Copy the note to the user buffer */
+
+  space = drv->ni_bufsize - read;
+  space = space < notelen ? space : notelen;
+  memcpy(buffer, drv->ni_buffer + read, space);
+  memcpy(buffer + space, drv->ni_buffer, notelen - space);
+
+  drv->ni_read = noteram_next(drv, read, NOTE_ALIGN(notelen));
+
+  return notelen;
+}
+#define noteram_get noteram_get_fast
 
 /****************************************************************************
  * Name: noteram_open
@@ -673,6 +729,37 @@ errout:
   return ret;
 }
 
+#ifdef CONFIG_DRIVERS_NOTERAM_FLUSH
+
+/****************************************************************************
+ * Name: noteram_dump_to_file
+ ****************************************************************************/
+
+static int noteram_dump_to_file(FAR struct noteram_driver_s *drv)
+{
+  struct file outfile;
+  struct lib_fileoutstream_s outfilestream;
+  // struct lib_bufferedoutstream_s outstream;
+  int ret;
+
+  ret = file_open(&outfile, CONFIG_DRIVERS_NOTERAM_FLUSH_PATH, O_WRONLY | O_CREAT | O_APPEND);
+  if (ret < 0)
+    {
+      return ret;
+    }
+
+  file_seek(&outfile, 0, SEEK_END); // needed for bad FS that don't place the file pointer at the end in append mode
+
+  lib_fileoutstream(&outfilestream, &outfile);
+  // lib_bufferedoutstream(&outstream, &outfilestream.common);
+  noteram_dump(drv, &outfilestream.common);
+
+  lib_stream_flush(&outfilestream.common);
+  file_close(&outfile);
+  return 0;
+}
+#endif
+
 /****************************************************************************
  * Name: noteram_add
  *
@@ -701,9 +788,6 @@ static void noteram_add(FAR struct note_driver_s *driver,
   unsigned int space;
   irqstate_t flags;
 #ifdef CONFIG_DRIVERS_NOTERAM_FLUSH
-  struct file outfile;
-  struct lib_fileoutstream_s outfilestream;
-  struct lib_bufferedoutstream_s outstream;
   int ret;
 #endif
 
@@ -721,21 +805,12 @@ static void noteram_add(FAR struct note_driver_s *driver,
   if (remain <= NOTE_ALIGN(notelen))
     {
 #ifdef CONFIG_DRIVERS_NOTERAM_FLUSH
-      ret = file_open(&outfile, CONFIG_DRIVERS_NOTERAM_FLUSH_PATH, O_WRONLY | O_CREAT | O_APPEND);
+      ret = noteram_dump_to_file(drv);
       if (ret < 0)
         {
           spin_unlock_irqrestore_wo_note(&drv->lock, flags);
           return;
         }
-
-      file_seek(&outfile, 0, SEEK_END); // needed for bad FS that don't place the file pointer at the end in append mode
-
-      lib_fileoutstream(&outfilestream, &outfile);
-      lib_bufferedoutstream(&outstream, &outfilestream.common);
-      noteram_dump(drv, &outstream.common);
-
-      lib_stream_flush(&outstream);
-      file_close(&outfile);
 
       /* Empty the buffer after flush */
 
@@ -1300,6 +1375,7 @@ static void noteram_dump(FAR struct noteram_driver_s *drv, FAR struct lib_outstr
 
   drv->ni_read = prev_read;
 }
+
 
 #ifdef CONFIG_DRIVERS_NOTERAM_CRASH_DUMP
 
